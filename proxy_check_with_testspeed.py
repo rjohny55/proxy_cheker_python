@@ -1,270 +1,237 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os
 import sys
 import json
 import time
-import threading
 import subprocess
 import re
 import platform
-import queue
+import ipaddress
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# --- Попытка импорта зависимостей ---
+# --- Импорты с проверкой ---
 try:
     import requests
     import urllib3
     from colorama import init, Fore, Style
-    # Отключаем предупреждения SSL
+    from tqdm import tqdm
+    
+    # Отключаем SSL предупреждения
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-except ImportError:
-    print("Ошибка: Не найдены библиотеки requests или colorama.")
-    print("Выполните: pip install requests colorama")
+except ImportError as e:
+    print(f"Ошибка: Не найдены необходимые библиотеки ({e})")
+    print('Выполните: pip install "requests[socks]" colorama tqdm')
     sys.exit(1)
 
-# --- Константы ---
+# --- Настройки ---
 CONFIG_FILE = Path("config.json")
 DEFAULT_CONFIG = {
-    "threads": 100,
-    "timeout": 10,              # Таймаут соединения (сек)
-    "max_ms": 5000,             # Макс. задержка (мс) для сохранения
+    "threads": 100,             # Количество потоков
+    "timeout": 10,              # Таймаут (сек)
+    "max_ms": 3000,             # Макс. latency
     "import_files": ["proxies.txt"],
     "export_file": "good_proxies.txt",
+    
+    # Проверка доступности (Ping/Latency)
     "host_check_url": "https://www.google.com",
-    "ip_check_url": "https://api.ipify.org?format=json",
-    # Пинг
-    "enable_ping": True,
+    
+    # Проверка анонимности (Сверка IP)
+    "check_anonymity": False,
+    "anonymity_url": "https://httpbin.org/ip", # Или https://api.ipify.org?format=json
+    
+    "verify_ssl": False,        
+    "enable_ping": True,        
     "ping_timeout_ms": 1000,
-    # Тест скорости
-    "enable_speed_test": False,
+    "enable_speed_test": False, 
     "speed_test_url": "http://speedtest.tele2.net/1MB.zip",
-    "speed_min_good_kbps": 100, # Просто для цветного выделения
+    "speed_limit_bytes": 524288, 
+    "allow_private_ips": False, 
     "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
 
-# --- Глобальные переменные ---
-stats = {
-    "checked": 0,
-    "good": 0,
-    "total": 0
-}
-stats_lock = threading.Lock()
-ping_command_available = False
-result_queue = queue.Queue()
+# --- Интерфейс и Конфигурация ---
 
-# --- Функции конфигурации и вывода ---
+def print_banner():
+    print(Fore.CYAN + r'''
+______                        _____  _                  _             
+| ___ \                      /  __ \| |                | |            
+| |_/ /_ __ _____  ___   _   | /  \/| |__   ___   ___  | | __ ___ _ __
+|  __/| '__/ _ \ \/ / | | |  | |    | '_ \ / _ \ / __| | |/ // _ \ '__|
+| |   | | | (_) >  <| |_| |  | \__/\| | | |  __/| (__  |   <|  __/ |  
+\_|   |_|  \___/_/\_\\__, |   \____/|_| |_|\___| \___| |_|\_\\___|_|  
+                      __/ |            v6.0 (Socks Edition)           
+                     |___/                                            
+''' + Style.RESET_ALL)
 
-def load_or_create_config():
-    """Загружает конфиг, дополняя отсутствующие ключи."""
+def print_settings(config, ping_avail):
+    print(Fore.YELLOW + "--- Настройки ---" + Style.RESET_ALL)
+    print(f" Потоки:        {Fore.GREEN}{config['threads']}{Style.RESET_ALL}")
+    print(f" Таймаут:       {Fore.GREEN}{config['timeout']}s{Style.RESET_ALL}")
+    print(f" Host Check:    {config['host_check_url']}")
+    
+    anon_status = f"{Fore.GREEN}ВКЛ{Style.RESET_ALL}" if config['check_anonymity'] else f"{Fore.RED}ВЫКЛ{Style.RESET_ALL}"
+    print(f" Anonymity:     {anon_status} ({config['anonymity_url']})")
+    
+    ping_status = f"{Fore.GREEN}ВКЛ{Style.RESET_ALL}" if (config['enable_ping'] and ping_avail) else f"{Fore.RED}ВЫКЛ{Style.RESET_ALL}"
+    print(f" ICMP Ping:     {ping_status}")
+    
+    speed_status = f"{Fore.GREEN}ВКЛ{Style.RESET_ALL}" if config['enable_speed_test'] else f"{Fore.RED}ВЫКЛ{Style.RESET_ALL}"
+    print(f" Speed Test:    {speed_status}")
+    print("-" * 50)
+
+def load_config():
     if not CONFIG_FILE.exists():
         try:
             with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
                 json.dump(DEFAULT_CONFIG, f, indent=4)
-        except Exception as e:
-            print(f"Ошибка создания конфига: {e}")
-            return DEFAULT_CONFIG
-
+        except: pass
+        return DEFAULT_CONFIG
     try:
         with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-            loaded = json.load(f)
-            config = DEFAULT_CONFIG.copy()
-            config.update(loaded)
-            return config
-    except Exception:
-        return DEFAULT_CONFIG
-
-def print_banner(config):
-    """Выводит баннер и настройки."""
-    print(Fore.GREEN + r'''
-___________ _______   ____   __  _____  _   _  _____ _____  _   __ ___________
-| ___ \ ___ \  _  \ \ / /\ \ / / /  __ \| | | ||  ___/  __ \| | / /|  ___| ___ \
-| |_/ / |_/ / | | |\ V /  \ V /  | /  \/| |_| || |__ | /  \/| |/ / | |__ | |_/ /
-|  __/|    /| | | |/   \   \ /   | |    |  _  ||  __|| |    |    \ |  __||    /
-| |   | |\ \\ \_/ / /^\ \  | |   | \__/\| | | || |___| \__/\| |\  \| |___| |\ \
-\_|   \_| \_|\___/\/   \/  \_/    \____/\_| |_/\____/ \____/\_| \_/\____/\_| \_|
-''' + Style.RESET_ALL)
-    
-    print(Fore.CYAN + "--- Настройки (из config.json) ---")
-    print(f"    Потоки: {config['threads']}")
-    print(f"    Тайм-аут: {config['timeout']} сек")
-    print(f"    Макс. пинг (HTTP): {config['max_ms']} мс")
-    print(f"    Импорт: {config['import_files']}")
-    print(f"    Экспорт: {config['export_file']}")
-    print(f"    Пинг (ICMP): {'Вкл' if config['enable_ping'] else 'Выкл'}")
-    print(f"    Тест скорости: {'Вкл' if config['enable_speed_test'] else 'Выкл'}")
-    if config['enable_speed_test']:
-        print(f"      URL: {config['speed_test_url']}")
-    print("-" * 40 + Style.RESET_ALL)
+            c = DEFAULT_CONFIG.copy()
+            c.update(json.load(f))
+            return c
+    except: return DEFAULT_CONFIG
 
 # --- Сетевые функции ---
 
-def check_ping_availability():
+def check_ping_tool():
     param = '-n' if platform.system().lower() == 'windows' else '-c'
     try:
         subprocess.run(['ping', param, '1', '127.0.0.1'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=1)
         return True
-    except:
-        return False
+    except: return False
 
 def system_ping(ip, timeout_ms):
-    if not ping_command_available: return None
     try:
         timeout_sec = timeout_ms / 1000.0
-        param_n = '-n' if platform.system().lower() == 'windows' else '-c'
-        param_w = '-w' if platform.system().lower() == 'windows' else '-W'
-        timeout_val = str(timeout_ms) if platform.system().lower() == 'windows' else str(timeout_sec)
-        
-        cmd = ['ping', param_n, '1', param_w, timeout_val, ip]
-        
-        # Скрываем окно на Windows
-        startupinfo = None
         if platform.system().lower() == 'windows':
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec + 0.5, startupinfo=startupinfo)
+            cmd = ['ping', '-n', '1', '-w', str(timeout_ms), ip]
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            kwargs = {'startupinfo': si, 'creationflags': subprocess.CREATE_NO_WINDOW}
+        else:
+            cmd = ['ping', '-c', '1', '-W', str(timeout_sec), ip]
+            kwargs = {}
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_sec + 0.5, **kwargs)
         if res.returncode == 0:
             match = re.search(r"time[=<]([\d.]+)\s?ms", res.stdout, re.IGNORECASE)
             return int(float(match.group(1))) if match else 1
-    except:
-        pass
+    except: pass
     return None
 
-def test_download_speed(proxies, url, timeout):
-    """Тестирует скорость скачивания (KB/s)."""
+def check_speed(proxies, url, limit, timeout, verify):
     try:
-        start_time = time.time()
-        bytes_downloaded = 0
-        with requests.get(url, proxies=proxies, stream=True, timeout=timeout, verify=False) as r:
+        start = time.time()
+        downloaded = 0
+        with requests.get(url, proxies=proxies, stream=True, timeout=timeout, verify=verify) as r:
             r.raise_for_status()
             for chunk in r.iter_content(chunk_size=8192):
-                bytes_downloaded += len(chunk)
-                # Если качаем дольше таймаута — прерываем
-                if time.time() - start_time > timeout:
+                downloaded += len(chunk)
+                if downloaded >= limit or (time.time() - start) > timeout:
                     break
-        
-        duration = time.time() - start_time
-        if duration < 0.01: duration = 0.01 # Защита от деления на 0
-        
-        speed_kbps = (bytes_downloaded / 1024) / duration
-        return int(speed_kbps)
-    except:
-        return None
+        duration = time.time() - start
+        if duration < 0.01: duration = 0.01
+        return int((downloaded / 1024) / duration)
+    except: return None
 
 def parse_proxy(proxy_str):
-    """Универсальный парсер прокси."""
-    proxy_str = proxy_str.strip()
-    if '://' in proxy_str: proxy_str = proxy_str.split('://')[-1]
-    
-    parts = proxy_str.split(':')
-    # ip:port
-    if len(parts) == 2:
-        return {"http": f"http://{proxy_str}", "https": f"http://{proxy_str}", "raw": proxy_str, "ip": parts[0]}
-    # ip:port:user:pass -> user:pass@ip:port
-    elif len(parts) == 4:
-        formatted = f"{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}"
-        return {"http": f"http://{formatted}", "https": f"http://{formatted}", "raw": proxy_str, "ip": parts[0]}
-    # user:pass@ip:port
-    elif '@' in proxy_str:
-        return {"http": f"http://{proxy_str}", "https": f"http://{proxy_str}", "raw": proxy_str, "ip": proxy_str.split('@')[1].split(':')[0]}
-    return None
+    raw = proxy_str.strip()
+    if not raw: return None
+    scheme = "http"
+    body = raw
+    if "://" in raw:
+        scheme, body = raw.split("://", 1)
+        scheme = scheme.lower()
 
-# --- Поток записи ---
-
-def file_writer_worker(filepath):
-    try:
-        with open(filepath, 'w', encoding='utf-8') as f:
-            while True:
-                item = result_queue.get()
-                if item is None: break
-                f.write(item + '\n')
-                f.flush()
-                result_queue.task_done()
-    except Exception as e:
-        print(f"Ошибка записи: {e}")
-
-# --- Основная логика ---
-
-def check_single_proxy(proxy_raw, config):
-    proxy_data = parse_proxy(proxy_raw)
-    if not proxy_data: return
-
-    proxy_dict = {"http": proxy_data['http'], "https": proxy_data['https']}
-    headers = {'User-Agent': config['user_agent']}
-    
-    start_time = time.perf_counter()
-    latency = None
-    ping_val = None
-    speed_val = None
-    is_alive = False
-    
-    try:
-        # 1. Проверка HTTP (Latency)
-        with requests.get(config['host_check_url'], proxies=proxy_dict, timeout=config['timeout'], stream=True, verify=False, headers=headers) as r:
-            if 200 <= r.status_code < 400:
-                is_alive = True
-        
-        latency = int((time.perf_counter() - start_time) * 1000)
-
-        # 2. Дополнительные тесты, если прокси жив
-        if is_alive:
-            # Пинг
-            if config['enable_ping'] and ping_command_available:
-                ping_val = system_ping(proxy_data['ip'], config['ping_timeout_ms'])
-            
-            # Скорость
-            if config['enable_speed_test']:
-                speed_val = test_download_speed(proxy_dict, config['speed_test_url'], config['timeout'])
-
-    except:
-        pass
-
-    # --- Сборка статуса ---
-    log_parts = []
-    status_color = Fore.RED
-    
-    if is_alive:
-        if latency <= config['max_ms']:
-            status_color = Fore.GREEN
-            log_parts.append(f"HTTP: {latency}ms")
-            
-            if ping_val is not None:
-                log_parts.append(f"Ping: {ping_val}ms")
-            
-            if speed_val is not None:
-                sp_color = Fore.GREEN if speed_val >= config['speed_min_good_kbps'] else Fore.YELLOW
-                log_parts.append(f"Speed: {sp_color}{speed_val} KB/s{Style.RESET_ALL}")
-            elif config['enable_speed_test']:
-                log_parts.append("Speed: Fail")
-
-            # Пишем в файл
-            result_queue.put(proxy_data['raw'])
-            with stats_lock: stats['good'] += 1
-        else:
-            status_color = Fore.YELLOW
-            log_parts.append(f"Slow: {latency}ms")
+    if '@' in body:
+        formatted_body = body
+        try:
+            ip = body.split('@')[1].split(':')[0]
+        except: return None
     else:
-        log_parts.append("Dead")
+        parts = body.split(':')
+        if len(parts) == 2:
+            ip, port = parts
+            formatted_body = f"{ip}:{port}"
+        elif len(parts) == 4:
+            ip, port, user, pwd = parts
+            formatted_body = f"{user}:{pwd}@{ip}:{port}"
+        else: return None
 
-    # Вывод в консоль
-    msg = " | ".join(log_parts)
-    display_proxy = (proxy_data['raw'][:25] + '..') if len(proxy_data['raw']) > 25 else proxy_data['raw']
-    print(f"{Fore.WHITE}{display_proxy:<30} {status_color}{msg}{Style.RESET_ALL}")
+    is_private = False
+    try:
+        if ipaddress.ip_address(ip).is_private: is_private = True
+    except: pass
 
-    # Обновление заголовка
-    with stats_lock:
-        stats['checked'] += 1
-        title = f"Checker | {stats['checked']}/{stats['total']} | Good: {stats['good']}"
-    
-    if platform.system() == 'Windows':
-        import ctypes
-        ctypes.windll.kernel32.SetConsoleTitleW(title)
-    else:
-        sys.stdout.write(f"\x1b]2;{title}\x07")
-        sys.stdout.flush()
+    full_url = f"{scheme}://{formatted_body}"
+    return {
+        "proxies": {"http": full_url, "https": full_url},
+        "ip": ip,
+        "raw": raw,
+        "is_private": is_private
+    }
+
+# --- Воркер ---
+
+def check_single_proxy(proxy_str, config, ping_available):
+    data = parse_proxy(proxy_str)
+    if not data: return None
+    if data['is_private'] and not config['allow_private_ips']: return None
+
+    result = {'proxy': data['raw'], 'latency': 0, 'ping': None, 'speed': None, 'anon': False}
+
+    # 1. ICMP Ping (Независимый)
+    if config['enable_ping'] and ping_available:
+        result['ping'] = system_ping(data['ip'], config['ping_timeout_ms'])
+
+    # 2. HTTP Host Check (Базовая проверка жизни)
+    try:
+        with requests.get(
+            config['host_check_url'],
+            proxies=data['proxies'],
+            timeout=config['timeout'],
+            headers={'User-Agent': config['user_agent']},
+            verify=config['verify_ssl'],
+            stream=True 
+        ) as r:
+            result['latency'] = int(r.elapsed.total_seconds() * 1000)
+            if r.status_code >= 400: return None
+    except Exception: return None
+
+    if result['latency'] > config['max_ms']: return None
+
+    # 3. Anonymity Check (Опционально)
+    if config['check_anonymity']:
+        try:
+            # Делаем запрос к чекеру IP (httpbin.org/ip и т.д.)
+            with requests.get(
+                config['anonymity_url'],
+                proxies=data['proxies'],
+                timeout=config['timeout'],
+                verify=config['verify_ssl']
+            ) as r:
+                if r.status_code == 200:
+                    # Проверяем, что в ответе есть IP прокси. 
+                    # Это значит, что трафик прошел через него.
+                    if data['ip'] in r.text:
+                        result['anon'] = True
+                    else:
+                        # Если IP прокси нет в ответе, возможно это прозрачный прокси 
+                        # или ротируемый (выходной IP другой). 
+                        # Если строгая проверка нужна - отбрасываем:
+                        return None 
+                else:
+                    return None
+        except Exception: return None
+
+    # 4. Speed Test
+    if config['enable_speed_test']:
+        result['speed'] = check_speed(data['proxies'], config['speed_test_url'], config['speed_limit_bytes'], config['timeout'], config['verify_ssl'])
+
+    return result
 
 # --- Main ---
 
@@ -272,47 +239,75 @@ def main():
     init()
     os.system('cls' if os.name == 'nt' else 'clear')
     
-    config = load_or_create_config()
-    print_banner(config)
+    config = load_config()
+    print_banner()
     
-    global ping_command_available
-    ping_command_available = check_ping_availability()
+    ping_avail = check_ping_tool()
+    print_settings(config, ping_avail)
     
-    # Загрузка прокси
+    # Загрузка
     proxies = set()
     for fname in config['import_files']:
         path = Path(fname)
         if path.exists():
             with open(path, 'r', encoding='utf-8') as f:
                 for line in f:
-                    if line.strip() and ':' in line: proxies.add(line.strip())
+                    if line.strip(): proxies.add(line.strip())
         else:
-            print(f"{Fore.YELLOW}Файл {fname} не найден{Style.RESET_ALL}")
+            print(f"{Fore.RED}Файл {fname} не найден!{Style.RESET_ALL}")
     
-    stats['total'] = len(proxies)
-    if stats['total'] == 0:
-        print(f"{Fore.RED}Прокси не найдены.{Style.RESET_ALL}")
-        return
-
-    # Запуск писателя
-    writer = threading.Thread(target=file_writer_worker, args=(config['export_file'],), daemon=True)
-    writer.start()
-
-    # Запуск воркеров
-    print(f"{Fore.CYAN}Начинаю проверку...{Style.RESET_ALL}")
-    try:
-        with ThreadPoolExecutor(max_workers=config['threads']) as ex:
-            futures = [ex.submit(check_single_proxy, p, config) for p in list(proxies)]
-            for f in futures: f.result()
-    except KeyboardInterrupt:
-        print(f"\n{Fore.YELLOW}Прервано...{Style.RESET_ALL}")
+    proxies_list = list(proxies)
+    total = len(proxies_list)
     
-    result_queue.put(None)
-    writer.join()
+    if total == 0:
+        print(Fore.RED + "Нет прокси для проверки. Добавьте их в proxies.txt" + Style.RESET_ALL)
+        input("Enter для выхода...")
+        sys.exit()
 
-    print("\n" + "="*40)
-    print(f"{Fore.GREEN}Готово. Рабочих: {stats['good']}{Style.RESET_ALL}")
-    input("Enter для выхода...")
+    print(f"Загружено уникальных прокси: {total}")
+    print(f"Результаты будут сохранены в: {Fore.YELLOW}{config['export_file']}{Style.RESET_ALL}")
+    input(f"Нажмите {Fore.GREEN}Enter{Style.RESET_ALL} для старта...")
+    print("-" * 50)
+
+    # Работа
+    good_count = 0
+    with open(config['export_file'], 'w', encoding='utf-8') as f_export:
+        with ThreadPoolExecutor(max_workers=config['threads']) as executor:
+            future_to_proxy = {executor.submit(check_single_proxy, p, config, ping_avail): p for p in proxies_list}
+            
+            pbar = tqdm(total=total, unit="prx", ncols=95, bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt} Good: {postfix}]")
+            pbar.postfix = 0
+            
+            for future in as_completed(future_to_proxy):
+                try:
+                    res = future.result()
+                    if res:
+                        good_count += 1
+                        pbar.postfix = good_count
+                        f_export.write(res['proxy'] + '\n')
+                        f_export.flush()
+                        
+                        info = [f"{res['latency']}ms"]
+                        if res['anon']: info.append("Anon:OK")
+                        if res['ping']: info.append(f"Ping:{res['ping']}")
+                        if res['speed']: info.append(f"Spd:{res['speed']}KB/s")
+                        
+                        status_str = f"{Fore.GREEN}OK ({'|'.join(info)}){Style.RESET_ALL}"
+                        proxy_display = (res['proxy'][:30] + '..') if len(res['proxy']) > 30 else res['proxy']
+                        tqdm.write(f"{proxy_display:<33} {status_str}")
+                except KeyboardInterrupt:
+                    executor.shutdown(wait=False)
+                    break
+                except Exception: pass
+                finally: pbar.update(1)
+            pbar.close()
+
+    print("\n" + "="*50)
+    print(f"{Fore.GREEN}Проверка завершена!{Style.RESET_ALL}")
+    print(f"Всего рабочих: {Fore.GREEN}{good_count}{Style.RESET_ALL}")
+    
+    if platform.system() == 'Windows':
+        os.system("pause")
 
 if __name__ == "__main__":
     main()
